@@ -1,0 +1,15 @@
+{
+  "name": "omp-codex-computer-use",
+  "version": "1.0.0",
+  "description": "Codex native macOS Computer Use (cua_repl) as tools for the oh-my-pi (omp) coding agent",
+  "license": "MIT",
+  "author": "Guilherme Varela",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/guilhermexp/omp-codex-computer-use.git"
+  },
+  "keywords": ["omp", "oh-my-pi", "extension", "computer-use", "macos", "accessibility", "codex"],
+  "omp": {
+    "extensions": ["./index.ts"]
+  }
+}

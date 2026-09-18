@@ -1,0 +1,22 @@
+{
+  "_": "Pin do que esta extensão consome de terceiros. `scripts/cua-preflight.py` compara com o que está instalado AGORA: divergência sai STALE-PIN (exit 5), contrato quebrado sai DRIFT (exit 3). Re-pinar só depois de olhar o que mudou: scripts/cua-preflight.py --update-pin",
+  "runtime": {
+    "source": "ChatGPT.app + ~/.codex/plugins/cache/openai-bundled/unified-computer-use/<versão>/.mcp.json",
+    "plugin_version": "26.915.31029",
+    "server": "rmcp 1.5.0",
+    "protocol_version": "2024-11-05",
+    "tools": [
+      "js",
+      "js_add_node_module_dir",
+      "js_reset",
+      "turn_ended"
+    ]
+  },
+  "upstream_extension": {
+    "repo": "https://github.com/guilhermexp/pi-codex-computer-use.git",
+    "checkout": "~/.pi/agent/git/github.com/guilhermexp/pi-codex-computer-use",
+    "commit": "1a7f6fd9b6b4ecb5660f62e607142027071a27be",
+    "note": "origem do porte (host Pi). Commit novo aqui = mudança para avaliar e, se valer, portar para esta extensão."
+  },
+  "verified_at": "2026-09-18"
+}
