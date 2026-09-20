@@ -7,9 +7,14 @@
 //
 // Diferenças conscientes em relação à versão de Pi:
 //  - sem fallback com paths/versões hardcoded: sem `.mcp.json` a tool falha dizendo o motivo, não mente;
-//  - o preâmbulo de instruções do runtime (~16 KB) vai só na primeira chamada da sessão;
+//  - o preâmbulo de instruções do runtime (~16 KB) vai só na primeira chamada da SESSÃO DE AGENTE,
+//    sobrevivendo a reinício do cua_repl (antes ele voltava inteiro a cada reinício);
+//  - estado durável por sessão de agente em disco: o host `omp --mode rpc-ui` é RECICLADO no meio da
+//    conversa (medido: pids 12020 → 39121 → 1472), e uma flag em memória voltava a zero com ele;
+//  - reinício do cua_repl é ANUNCIADO no resultado, em vez de virar `x is not defined` na cara do modelo;
+//  - o mimeType da imagem sai do byte, não do rótulo do runtime (ele anuncia PNG e manda JPEG);
 //  - todo screenshot é gravado em disco e o path entra no resultado — evidência para o eixo Reality.
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import type { Subprocess } from "bun";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
@@ -18,11 +23,24 @@ const PLUGIN_DIR = `${HOME}/.codex/plugins/cache/openai-bundled/unified-computer
 const PREAMBLE_PREFIX = "## Computer Use";
 const SHOT_DIR = `${(process.env.TMPDIR ?? "/tmp").replace(/\/+$/, "")}/omp-codex-cua`;
 const DEFAULT_TIMEOUT_MS = 30_000;
+// Estado que precisa sobreviver à RECICLAGEM DO HOST: o processo `omp --mode
+// rpc-ui` que carrega esta extensão é substituído durante a sessão (medido:
+// pids 12020 → 39121 → 1472 na mesma conversa), e com ele morrem o cua_repl e
+// qualquer flag em memória. Arquivo por sessão de agente, não por processo.
+const STATE_DIR = `${(process.env.TMPDIR ?? "/tmp").replace(/\/+$/, "")}/omp-codex-cua`;
 
 interface McpConfig {
   command: string;
   args: string[];
   env: Record<string, string>;
+}
+
+/// Estado da ponte que precisa sobreviver à troca do processo host.
+interface BridgeState {
+  /// O preâmbulo de ~19 KB do runtime já foi entregue a este contexto.
+  preambleSent: boolean;
+  /// Quantos REPLs esta sessão de agente já teve. > 1 significa estado perdido.
+  boots: number;
 }
 
 interface RpcResponse {
@@ -81,7 +99,14 @@ class CuaClient {
   // Map: chaves numéricas criadas e removidas em runtime.
   #pending = new Map<number, (msg: RpcResponse) => void>();
   #stderr = "";
-  preambleSent = false;
+  #exitReason: string | null = null;
+  // Chamado depois de cada handshake: um REPL novo nasceu, e quem cuida do
+  // estado durável decide se isso é a primeira sessão ou uma perda de estado.
+  #onBoot: (exitReason: string | null) => void;
+
+  constructor(onBoot: (exitReason: string | null) => void) {
+    this.#onBoot = onBoot;
+  }
 
   #write(msg: unknown) {
     const proc = this.#proc;
@@ -130,12 +155,14 @@ class CuaClient {
     })()
       .catch(() => {})
       .finally(() => {
-        const why = `processo cua_repl terminou. stderr: ${this.#stderr || "(vazio)"}`;
+        const signal = proc.signalCode ?? null;
+        const code = proc.exitCode ?? null;
+        this.#exitReason = `${signal ? `sinal ${signal}` : `exit ${code ?? "?"}`}, stderr: ${this.#stderr || "(vazio)"}`;
+        const why = `processo cua_repl terminou (${this.#exitReason})`;
         for (const resolve of this.#pending.values()) resolve({ error: { message: why } });
         this.#pending.clear();
         this.#proc = null;
         this.#starting = null;
-        this.preambleSent = false;
       });
   }
 
@@ -179,6 +206,7 @@ class CuaClient {
       throw new Error(`handshake MCP falhou: ${init.error.message ?? "erro sem mensagem"}`);
     }
     this.#write({ jsonrpc: "2.0", method: "notifications/initialized" });
+    this.#onBoot(this.#exitReason);
   }
 
   async call(name: string, args: unknown, timeoutMs: number): Promise<RpcResponse["result"]> {
@@ -205,7 +233,7 @@ class CuaClient {
   }
 }
 
-const RUNTIME_API = `Executa JavaScript no runtime nativo de Computer Use do Codex (cua_repl). O estado persiste entre chamadas da mesma sessão.
+const RUNTIME_API = `Executa JavaScript no runtime nativo de Computer Use do Codex (cua_repl). O estado do REPL (variáveis, handles de app/tab) persiste entre chamadas enquanto a sessão viver; se ela reiniciar, o resultado diz isso na primeira linha — aí rebinde antes de agir.
 
 Só macOS. Requer ChatGPT.app instalado e permissão de Acessibilidade para "Codex Computer Use.app".
 
@@ -214,12 +242,12 @@ APIs do runtime (superfície completa, medida em 2026-09-18):
 - await cua.listApps() — todos os apps instalados
 - let app = await cua.getApp("Nome" | "bundle.id") — handle do app (lança se preciso) + árvore inicial
 - await app.getAXState({ disableDiffing: true }) — árvore de acessibilidade com índice e "ID:" de cada nó
-- await app.getScreenshot() — bytes PNG só da janela do app (sem pixel de outra janela por cima)
+- await app.getScreenshot() — imagem só da janela do app (sem pixel de outra janela por cima); o runtime devolve JPEG mesmo anunciando PNG
 - await app.getAXStateAndScreenshot(opts) — árvore + screenshot em uma ida só
 - await app.click(indice | [x, y]) — clique por índice de nó (preferir) ou coordenada
 - await app.paste("texto", { format }) — insere o texto EXATO (não passa por autocorreção)
 - await app.typeText("texto") — tecla por tecla, sujeito à autocorreção do campo
-- await app.setValue(indice, "valor") — só em nó "(settable)"
+- await app.setValue(indice, "valor") — só em nó "(settable)", e mesmo aí pode virar no-op silencioso (medido no Zeron/GPUI: nenhum erro, valor inalterado) — releia o Value e caia para typeText/paste
 - await app.selectText(indice, "texto", { prefix, suffix }) — seleciona trecho dentro do nó
 - await app.pressKey("Return" | "super+n" | "super+w" | "Tab")
 - await app.scroll(indice | [x, y], "up" | "down", paginas) — páginas, não pixels
@@ -246,39 +274,105 @@ Regras que evitam erro:
 - índices de nó expiram a cada ação: chame getAXState e aja na MESMA chamada, nunca reuse índice antigo
 - case por "ID:" do nó (ex.: DontSaveButton), não por rótulo — o macOS pode estar em outro idioma
 - prefira click(indice) a coordenada: coordenada depende do screenshot mais recente
-- assertiva de string literal: paste() (exato, provado) ou setValue() em nó "(settable)"; typeText
-  sofre autocapitalize (o Editor de Texto transformou "omp" em "Omp") — se usar, releia o Value
+- assertiva de string literal: paste() (exato, provado) ou setValue() em nó "(settable)"; setValue
+  falha calado em app GPUI (Zeron), e typeText sofre autocapitalize (o Editor de Texto transformou
+  "omp" em "Omp") — nos dois casos releia o Value depois de escrever
 - app com painel modal (ex.: "Abrir" do Editor de Texto) engole super+q: cancele o painel (Escape ou o nó CancelButton) antes de encerrar
 - isolamento é do alvo: o app lê a config/banco real do usuário; nunca transforme dado real em fixture
 - feche/encerre só o que esta sessão abriu`;
 
 export default function ompCodexComputerUse(pi: ExtensionAPI) {
   const z = pi.zod;
-  const client = new CuaClient();
   let shotSeq = 0;
+  // Id da sessão de agente, não do processo: é a única chave que sobrevive à
+  // troca do host. `null` até o `session_start` (e no harness de teste) — aí o
+  // estado vive só em memória.
+  let sessionId: string | null = null;
+  let memoryState: BridgeState = { preambleSent: false, boots: 0 };
+  let pendingNotice: string | null = null;
+
+  function statePath(): string | null {
+    return sessionId ? `${STATE_DIR}/session-${sessionId.replace(/[^\w.-]/g, "_")}.json` : null;
+  }
+
+  function readState(): BridgeState {
+    const path = statePath();
+    if (!path || !existsSync(path)) return memoryState;
+    try {
+      const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
+      if (raw && typeof raw === "object") {
+        const parsed = raw as { preambleSent?: unknown; boots?: unknown };
+        return {
+          preambleSent: parsed.preambleSent === true,
+          boots: typeof parsed.boots === "number" ? parsed.boots : 0,
+        };
+      }
+    } catch {}
+    return memoryState;
+  }
+
+  function writeState(state: BridgeState) {
+    memoryState = state;
+    const path = statePath();
+    if (!path) return;
+    try {
+      mkdirSync(STATE_DIR, { recursive: true });
+      writeFileSync(path, JSON.stringify(state));
+    } catch {}
+  }
+
+  // Um REPL novo nasceu. Se esta sessão de agente já tinha tido um, o modelo
+  // precisa saber ANTES de reusar um handle: foi exatamente assim que um
+  // `zeron is not defined` apareceu do nada no meio de uma sessão.
+  const client = new CuaClient((exitReason) => {
+    const state = readState();
+    const next = { preambleSent: state.preambleSent, boots: state.boots + 1 };
+    writeState(next);
+    if (next.boots > 1) {
+      const why = exitReason ?? "host do omp reciclado (processo desta extensão é novo)";
+      pendingNotice = `[cua_repl reiniciou — ${why}] As variáveis do REPL e os handles de app/tab desta sessão foram perdidos: rebinde com cua.getApp/cua.getTab antes de agir.`;
+    }
+  });
+
+  // O runtime anuncia image/png e manda JPEG; com o rótulo errado o host recusa
+  // a imagem inteira. O byte manda.
+  function sniffImage(bytes: Buffer): { mimeType: string; ext: string } | null {
+    if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return { mimeType: "image/jpeg", ext: "jpg" };
+    if (bytes.length >= 8 && bytes.readUInt32BE(0) === 0x89504e47) return { mimeType: "image/png", ext: "png" };
+    if (bytes.length >= 12 && bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") return { mimeType: "image/webp", ext: "webp" };
+    if (bytes.length >= 6 && bytes.toString("ascii", 0, 3) === "GIF") return { mimeType: "image/gif", ext: "gif" };
+    return null;
+  }
 
   async function render(result: RpcResponse["result"]): Promise<RenderedResult> {
     const content: RenderedResult["content"] = [];
     const screenshots: string[] = [];
+    if (pendingNotice) {
+      content.push({ type: "text", text: pendingNotice });
+      pendingNotice = null;
+    }
     for (const raw of result?.content ?? []) {
       if (!raw || typeof raw !== "object") continue;
       const part = raw as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
       if (part.type === "text" && typeof part.text === "string") {
         if (part.text.startsWith(PREAMBLE_PREFIX)) {
-          if (client.preambleSent) continue;
-          client.preambleSent = true;
+          const state = readState();
+          if (state.preambleSent) continue;
+          writeState({ preambleSent: true, boots: state.boots });
         }
         content.push({ type: "text", text: part.text });
         continue;
       }
       if (part.type === "image" && typeof part.data === "string") {
-        const mimeType = typeof part.mimeType === "string" ? part.mimeType : "image/png";
-        const path = `${SHOT_DIR}/shot-${process.pid}-${++shotSeq}.png`;
+        const declared = typeof part.mimeType === "string" ? part.mimeType : "image/png";
+        const bytes = Buffer.from(part.data, "base64");
+        const sniffed = sniffImage(bytes) ?? { mimeType: declared, ext: declared.split("/")[1] || "bin" };
+        const path = `${SHOT_DIR}/shot-${process.pid}-${++shotSeq}.${sniffed.ext}`;
         try {
-          await Bun.write(path, Buffer.from(part.data, "base64"));
+          await Bun.write(path, bytes);
           screenshots.push(path);
         } catch {}
-        content.push({ type: "image", data: part.data, mimeType });
+        content.push({ type: "image", data: part.data, mimeType: sniffed.mimeType });
       }
     }
     if (screenshots.length) content.push({ type: "text", text: `screenshots gravados: ${screenshots.join(", ")}` });
@@ -319,6 +413,14 @@ export default function ompCodexComputerUse(pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `reset falhou: ${String(err)}` }], isError: true };
       }
     },
+  });
+
+  // A chave do estado durável. Sem ela o preâmbulo voltaria inteiro a cada
+  // troca do host, e um REPL novo passaria por REPL antigo.
+  pi.on("session_start", (_event, ctx) => {
+    try {
+      sessionId = ctx.sessionManager.getSessionId() ?? null;
+    } catch {}
   });
 
   // Sem isso o cua_repl fica órfão quando a sessão encerra.
