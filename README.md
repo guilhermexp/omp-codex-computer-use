@@ -75,6 +75,7 @@ Resets the persistent REPL (`js_reset`) without closing windows or apps.
 - **Neither `typeText` nor `setValue` is trustworthy alone.** TextEdit turned `omp` into `Omp` (autocapitalize); `setValue` on a GPUI app (Zeron's search field, node marked `(settable)`) returned success and changed nothing. Prefer `paste()` for literals, and re-read the node's `Value` after writing either way.
 - **Node indexes expire on every action.** Call `getAXState` and act in the *same* tool call; never reuse an index from a previous call.
 - **Match nodes by `ID:`, not by label.** A pt-BR macOS reports `botão Apagar`, not `Don't Save`; the `ID:` (`DontSaveButton`) is stable.
+- **iPad/iPhone apps on the Mac need the running bundle path.** macOS runs them from a copy at `/private/var/folders/.../Wrapper/X.app` that shares the bundle id with `/Applications/X.app`. `getApp("<bundle.id>")` throws `Ambiguous app identifier`, and `getApp("X")` or `getApp("/Applications/X.app")` throws `Running application not found`. Read the path with `lsappinfo info -only bundlepath <bundle.id>` and pass it to `getApp`; the UUID in it changes when the app relaunches.
 
 ## Differences from the Pi version
 

@@ -278,6 +278,10 @@ Regras que evitam erro:
   falha calado em app GPUI (Zeron), e typeText sofre autocapitalize (o Editor de Texto transformou
   "omp" em "Omp") — nos dois casos releia o Value depois de escrever
 - app com painel modal (ex.: "Abrir" do Editor de Texto) engole super+q: cancele o painel (Escape ou o nó CancelButton) antes de encerrar
+- app de iPad/iPhone rodando no Mac (ex.: PPPoker): getApp por bundle id dá "Ambiguous app identifier" e por
+  nome ou /Applications/X.app dá "Running application not found" — o macOS executa uma cópia em
+  /private/var/folders/.../Wrapper/X.app com o mesmo bundle id. Pegue o caminho do processo no shell com
+  \`lsappinfo info -only bundlepath <bundle.id>\` (linha bundle path=) e passe esse caminho ao getApp (o UUID muda ao reabrir o app)
 - isolamento é do alvo: o app lê a config/banco real do usuário; nunca transforme dado real em fixture
 - feche/encerre só o que esta sessão abriu`;
 
