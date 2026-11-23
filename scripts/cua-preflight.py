@@ -15,6 +15,7 @@ Exit:
 
 Uso:
   scripts/cua-preflight.py [--json] [--remote] [--update-pin]
+    --browser     exige que o host da sessão exponha ao menos um navegador
     --remote      consulta `git ls-remote` do repo de origem (rede; ausência não falha)
     --update-pin  regrava o pin com o estado atual (rodar só depois de olhar o que mudou)
 """
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -31,7 +33,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PIN_PATH = REPO_ROOT / "upstream.json"
-PLUGIN_DIR = Path.home() / ".codex/plugins/cache/openai-bundled/unified-computer-use"
+PLUGIN_DIR = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "plugins/cache/openai-bundled/unified-computer-use"
 REQUIRED_TOOLS = ("js", "js_reset")
 PROTOCOL_VERSION = "2024-11-05"
 
@@ -49,7 +51,10 @@ class Infra(Exception):
 def resolve_manifest() -> tuple[str, dict]:
     if not PLUGIN_DIR.is_dir():
         raise Infra(f"{PLUGIN_DIR} não existe (ChatGPT.app não instalado ou plugin não materializado)")
-    versions = sorted((p.name for p in PLUGIN_DIR.iterdir() if p.is_dir()), reverse=True)
+    versions = sorted(
+        (p.name for p in PLUGIN_DIR.iterdir() if p.is_dir() and re.fullmatch(r"\d+(?:\.\d+)*", p.name)),
+        key=lambda name: tuple(map(int, name.split("."))), reverse=True,
+    )
     if not versions:
         raise Infra(f"{PLUGIN_DIR} sem nenhuma versão")
     for version in versions:
@@ -59,6 +64,8 @@ def resolve_manifest() -> tuple[str, dict]:
         server = json.loads(manifest.read_text()).get("mcpServers", {}).get("cua_repl")
         if not isinstance(server, dict):
             raise Drift(f"{manifest} não tem mcpServers.cua_repl (versões: {', '.join(versions)})")
+        if server.get("enabled") is False:
+            raise Infra(f"cua_repl está desativado em {manifest}")
         return version, server
     raise Infra(f"nenhum .mcp.json em {PLUGIN_DIR}/<versão>/ (versões: {', '.join(versions)})")
 
@@ -72,7 +79,7 @@ class Client:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env={**os.environ, **env, "CUA_REPL_ENABLED_SURFACES": "computer"},
+            env={**os.environ, **env},
             text=True,
             bufsize=1,
         )
@@ -100,26 +107,24 @@ class Client:
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            # A extensão aceita a elicitação de política; o preflight faz o mesmo para
-            # provar que esse caminho segue sendo o que desbloqueia a chamada.
-            if msg.get("method") == "elicitation/create" and msg.get("id") is not None:
-                self.send({
-                    "jsonrpc": "2.0",
-                    "id": msg["id"],
-                    "result": {"action": "accept", "content": {"source": "computer-use-persisted-state", "persist": "always"}},
-                })
-                continue
+            if msg.get("method") in ("elicitation/create", "mcpServer/elicitation/request") and msg.get("id") is not None:
+                self.send({"jsonrpc": "2.0", "id": msg["id"], "result": {"action": "decline"}})
+                raise Infra("o runtime pediu confirmação interativa; abra a ferramenta na interface do OMP")
             if msg.get("id") == req_id:
                 if "error" in msg:
                     raise Drift(f"'{method}' devolveu erro: {msg['error']}")
                 return msg.get("result", {})
 
     def close(self) -> None:
-        self.proc.kill()
-        self.proc.wait(timeout=10)
+        self.proc.stdin.close()
+        try:
+            self.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.proc.terminate()
+            self.proc.wait(timeout=10)
 
 
-def probe_runtime() -> dict:
+def probe_runtime(require_browser: bool = False) -> dict:
     """Estado vivo do runtime; levanta Drift/Infra quando o contrato não vale."""
     version, server = resolve_manifest()
     command, args = server.get("command"), server.get("args")
@@ -131,7 +136,18 @@ def probe_runtime() -> dict:
     if "CUA_REPL_ENABLED_SURFACES" not in env:
         raise Drift(f"env do manifesto perdeu CUA_REPL_ENABLED_SURFACES (versão {version})")
 
+    surfaces = env["CUA_REPL_ENABLED_SURFACES"].split(",")
+    keys = ("BROWSER_USE_ACCESS_PIPE_PATH", "BROWSER_USE_ACCESS_VERIFYING_IDENTITY")
+    has_host = all(key in server.get("env_vars", []) and os.environ.get(key) for key in keys)
+    if require_browser and "browser" not in surfaces:
+        raise Infra("o manifesto não habilita navegador")
+    if "browser" in surfaces and not has_host:
+        if require_browser or "computer" not in surfaces:
+            raise Infra("esta sessão não recebeu o host de abas do Codex")
+        env = {**env, "CUA_REPL_ENABLED_SURFACES": "computer"}
+
     client = Client(command, args, env)
+    app_server = None
     try:
         init = client.request(
             "initialize",
@@ -148,22 +164,55 @@ def probe_runtime() -> dict:
         if missing:
             raise Drift(f"tools ausentes no runtime: {', '.join(missing)} (disponíveis: {', '.join(map(str, tools))})")
 
-        result = client.request(
-            "tools/call",
-            {"name": "js", "arguments": {"code": "let s = await cua.getState(); nodeRepl.write('PREFLIGHT_APPS=' + s.apps.length);", "timeout_ms": 30000}},
-        )
-        text = "\n".join(p.get("text", "") for p in result.get("content", []) if p.get("type") == "text")
-        marker = "PREFLIGHT_APPS="
-        if marker not in text:
-            raise Drift(f"chamada 'js' não devolveu o marcador; API cua.getState/nodeRepl.write mudou. Trecho: {text[-300:] or '(vazio)'}")
+        arguments = {"code": "await cua.getState();", "timeout_ms": 30000}
+        if cli := env.get("CODEX_CLI_PATH"):
+            if not Path(cli).is_file():
+                raise Infra(f"CLI do app server ausente: {cli}")
+            app_server = Client(cli, ["app-server", "--stdio"], {})
+            app_server.request("initialize", {"clientInfo": {"name": "cua-preflight", "version": "1.0.0"}})
+            app_server.send({"method": "initialized"})
+            thread = app_server.request("thread/start", {"ephemeral": True, "cwd": os.getcwd(), "sandbox": "read-only"})
+            result = app_server.request("mcpServer/tool/call", {
+                "threadId": thread["thread"]["id"], "server": "cua_repl", "tool": "js", "arguments": arguments,
+            })
+        else:
+            result = client.request("tools/call", {"name": "js", "arguments": arguments})
+        parts = [p["text"] for p in result.get("content", []) if p.get("type") == "text"]
+        if result.get("isError"):
+            reason = " ".join(parts)
+            if "sandbox_apply: Operation not permitted" in reason or "sandbox_apply: Operation not permitted" in client.stderr:
+                raise Infra("a sandbox desta sessão impediu o macOS de iniciar a sandbox do runtime")
+            raise Drift(f"cua.getState falhou: {reason[-600:]}")
+        state = None
+        for part in parts:
+            try:
+                value = json.loads(part)
+            except ValueError:
+                continue
+            if isinstance(value, dict) and isinstance(value.get("apps"), list):
+                state = value
+                break
+        if state is None:
+            raise Drift("cua.getState não devolveu o inventário de apps")
+        errors = state.get("errors", [])
+        blocking_errors = [error for error in errors if require_browser or not error.startswith("Browsers:")]
+        if blocking_errors:
+            raise Infra("; ".join(blocking_errors))
+        if require_browser and not state.get("browsers"):
+            raise Infra("o host respondeu sem navegadores conectados")
         return {
             "plugin_version": version,
             "server": f"{info.get('name')} {info.get('version')}",
-            "protocol_version": PROTOCOL_VERSION,
+            "protocol_version": init.get("protocolVersion"),
             "tools": tools,
-            "apps_visible": text.split(marker, 1)[1].split("\n", 1)[0].strip(),
+            "apps_visible": len(state["apps"]),
+            "browsers_visible": len(state.get("browsers", [])),
+            "transport": "codex-app-server" if app_server else "mcp-stdio",
+            "inventory_warnings": errors,
         }
     finally:
+        if app_server:
+            app_server.close()
         client.close()
 
 
@@ -233,7 +282,7 @@ def main() -> int:
     as_json, check_remote, update_pin = "--json" in argv, "--remote" in argv, "--update-pin" in argv
 
     try:
-        live = probe_runtime()
+        live = probe_runtime(require_browser="--browser" in argv)
     except Drift as err:
         report: dict[str, object] = {"status": "DRIFT", "reason": str(err)}
     except Infra as err:
