@@ -2,8 +2,8 @@
   "_": "Pin do que esta extensão consome de terceiros. `scripts/cua-preflight.py` compara com o que está instalado AGORA: divergência sai STALE-PIN (exit 5), contrato quebrado sai DRIFT (exit 3). Re-pinar só depois de olhar o que mudou: scripts/cua-preflight.py --update-pin",
   "runtime": {
     "source": "ChatGPT.app + ~/.codex/plugins/cache/openai-bundled/unified-computer-use/<versão>/.mcp.json",
-    "plugin_version": "26.915.31029",
-    "server": "rmcp 1.5.0",
+    "plugin_version": "26.1117.41037",
+    "server": "rmcp 3.5.1",
     "protocol_version": "2024-11-05",
     "tools": [
       "js",
@@ -18,5 +18,5 @@
     "commit": "1a7f6fd9b6b4ecb5660f62e607142027071a27be",
     "note": "origem do porte (host Pi). Commit novo aqui = mudança para avaliar e, se valer, portar para esta extensão."
   },
-  "verified_at": "2026-09-18"
+  "verified_at": "2026-11-23"
 }

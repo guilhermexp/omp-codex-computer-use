@@ -13,8 +13,8 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import type { Subprocess } from "bun";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-const HOME = process.env.HOME ?? "";
-const PLUGIN_DIR = `${HOME}/.codex/plugins/cache/openai-bundled/unified-computer-use`;
+const codexHome = process.env.CODEX_HOME ?? `${process.env.HOME}/.codex`;
+const PLUGIN_DIR = `${codexHome}/plugins/cache/openai-bundled/unified-computer-use`;
 const PREAMBLE_PREFIX = "## Computer Use";
 const SHOT_DIR = `${(process.env.TMPDIR ?? "/tmp").replace(/\/+$/, "")}/omp-codex-cua`;
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -23,12 +23,14 @@ interface McpConfig {
   command: string;
   args: string[];
   env: Record<string, string>;
+  browserUnavailable: boolean;
 }
 
 interface RpcResponse {
-  id?: number;
+  id?: number | string;
+  params?: Record<string, unknown>;
   method?: string;
-  result?: { content?: unknown[]; isError?: boolean };
+  result?: { thread?: { id?: string }; content?: unknown[]; isError?: boolean };
   error?: { message?: string };
 }
 
@@ -43,45 +45,61 @@ type CuaProcess = Subprocess<"pipe", "pipe", "pipe">;
 function asRpcResponse(value: unknown): RpcResponse | null {
   if (!value || typeof value !== "object") return null;
   const msg = value as Record<string, unknown>;
-  const id = typeof msg.id === "number" ? msg.id : undefined;
+  const id = typeof msg.id === "number" || typeof msg.id === "string" ? msg.id : undefined;
   const method = typeof msg.method === "string" ? msg.method : undefined;
   const result = msg.result && typeof msg.result === "object" ? (msg.result as RpcResponse["result"]) : undefined;
   const error = msg.error && typeof msg.error === "object" ? (msg.error as RpcResponse["error"]) : undefined;
-  return { id, method, result, error };
+  return { id, method, params: msg.params as RpcResponse["params"], result, error };
 }
 
-function resolveMcpConfig(): McpConfig {
-  if (!existsSync(PLUGIN_DIR)) {
+export function resolveMcpConfig(pluginDir = PLUGIN_DIR, hostEnv = process.env): McpConfig {
+  if (!existsSync(pluginDir)) {
     throw new Error(
-      `runtime do Codex Computer Use ausente: ${PLUGIN_DIR} não existe. Instale/abra o ChatGPT.app para materializar o plugin unified-computer-use.`,
+      `runtime do Codex Computer Use ausente: ${pluginDir} não existe. Instale/abra o ChatGPT.app para materializar o plugin unified-computer-use.`,
     );
   }
-  const versions = readdirSync(PLUGIN_DIR).sort().reverse();
+  const versions = readdirSync(pluginDir).filter((name) => /^\d+(?:\.\d+)*$/.test(name))
+    .sort((a, b) => b.localeCompare(a, "en", { numeric: true }));
   for (const version of versions) {
-    const mcpPath = `${PLUGIN_DIR}/${version}/.mcp.json`;
+    const mcpPath = `${pluginDir}/${version}/.mcp.json`;
     if (!existsSync(mcpPath)) continue;
     const manifest: unknown = JSON.parse(readFileSync(mcpPath, "utf8"));
-    const server = (manifest as { mcpServers?: { cua_repl?: { command?: unknown; args?: unknown; env?: unknown } } })?.mcpServers?.cua_repl;
+    const server = (manifest as { mcpServers?: { cua_repl?: { command?: unknown; args?: unknown; env?: unknown; enabled?: boolean; env_vars?: string[] } } })?.mcpServers?.cua_repl;
+    if (server?.enabled === false) throw new Error(`cua_repl está desativado em ${mcpPath}`);
     if (typeof server?.command !== "string" || !Array.isArray(server.args)) continue;
     const env = server.env && typeof server.env === "object" ? (server.env as Record<string, string>) : {};
+    const surfaces = env.CUA_REPL_ENABLED_SURFACES?.split(",") ?? ["computer"];
+    const browserHostKeys = ["BROWSER_USE_ACCESS_PIPE_PATH", "BROWSER_USE_ACCESS_VERIFYING_IDENTITY"];
+    const browserUnavailable = surfaces.includes("browser") &&
+      !browserHostKeys.every((key) => server.env_vars?.includes(key) && hostEnv[key]);
+    if (browserUnavailable && !surfaces.includes("computer")) {
+      throw new Error("O manifesto habilita apenas navegador e esta sessão não recebeu o host de abas.");
+    }
     return {
       command: server.command,
       args: server.args.filter((a): a is string => typeof a === "string"),
-      // Só a superfície nativa: sem isso o runtime exige turn token do browser do Codex.
-      env: { ...env, CUA_REPL_ENABLED_SURFACES: "computer" },
+      env: { ...env, CUA_REPL_ENABLED_SURFACES: browserUnavailable ? "computer" : surfaces.join(",") },
+      browserUnavailable,
     };
   }
-  throw new Error(`nenhum .mcp.json com mcpServers.cua_repl em ${PLUGIN_DIR}/<versão>/ (versões: ${versions.join(", ") || "nenhuma"})`);
+  throw new Error(`nenhum .mcp.json com mcpServers.cua_repl em ${pluginDir}/<versão>/ (versões: ${versions.join(", ") || "nenhuma"})`);
 }
 
 class CuaClient {
   #proc: CuaProcess | null = null;
   #starting: Promise<void> | null = null;
   #nextId = 1;
+  #threadId: string | null = null;
   // Map: chaves numéricas criadas e removidas em runtime.
   #pending = new Map<number, (msg: RpcResponse) => void>();
   #stderr = "";
   preambleSent = false;
+  browserNotice = false;
+  #confirm: (message: string) => Promise<boolean>;
+
+  constructor(confirm: (message: string) => Promise<boolean>) {
+    this.#confirm = confirm;
+  }
 
   #write(msg: unknown) {
     const proc = this.#proc;
@@ -92,13 +110,14 @@ class CuaClient {
 
   #pump(proc: CuaProcess) {
     const decoder = new TextDecoder();
+    const stderrDecoder = new TextDecoder();
     void (async () => {
-      for await (const chunk of proc.stderr) this.#stderr = (this.#stderr + decoder.decode(chunk)).slice(-4000);
+      for await (const chunk of proc.stderr) this.#stderr = (this.#stderr + stderrDecoder.decode(chunk, { stream: true })).slice(-4000);
     })().catch(() => {});
     void (async () => {
       let buf = "";
       for await (const chunk of proc.stdout) {
-        buf += decoder.decode(chunk);
+        buf += decoder.decode(chunk, { stream: true });
         for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
           const line = buf.slice(0, nl).trim();
           buf = buf.slice(nl + 1);
@@ -111,16 +130,21 @@ class CuaClient {
           }
           const msg = asRpcResponse(parsed);
           if (!msg) continue;
-          // O runtime confirma política por elicitation/create; aceitamos em nome da sessão.
-          if (msg.method === "elicitation/create" && msg.id !== undefined) {
-            this.#write({
-              jsonrpc: "2.0",
-              id: msg.id,
-              result: { action: "accept", content: { source: "computer-use-persisted-state", persist: "always" } },
+          if ((msg.method === "elicitation/create" || msg.method === "mcpServer/elicitation/request") && msg.id !== undefined) {
+            const params = msg.params;
+            const schema = params?.requestedSchema as { type?: string; properties?: object } | undefined;
+            const fromCua = msg.method === "elicitation/create" ||
+              (params?.serverName === "cua_repl" && params?.threadId === this.#threadId);
+            const canConfirm = fromCua && (!params?.mode || params.mode === "form") && schema?.type === "object" &&
+              !Object.keys(schema.properties ?? {}).length && typeof params?.message === "string";
+            const confirmed = canConfirm && await this.#confirm(params.message as string).catch(() => false);
+            if (this.#proc === proc) this.#write({
+              jsonrpc: "2.0", id: msg.id,
+              result: confirmed ? { action: "accept", content: {} } : { action: "decline" },
             });
             continue;
           }
-          const resolve = msg.id === undefined ? undefined : this.#pending.get(msg.id);
+          const resolve = typeof msg.id === "number" && !msg.method ? this.#pending.get(msg.id) : undefined;
           if (resolve) {
             this.#pending.delete(msg.id);
             resolve(msg);
@@ -130,6 +154,7 @@ class CuaClient {
     })()
       .catch(() => {})
       .finally(() => {
+        if (this.#proc !== proc) return;
         const why = `processo cua_repl terminou. stderr: ${this.#stderr || "(vazio)"}`;
         for (const resolve of this.#pending.values()) resolve({ error: { message: why } });
         this.#pending.clear();
@@ -156,40 +181,61 @@ class CuaClient {
 
   async #boot() {
     const config = resolveMcpConfig();
-    const proc = Bun.spawn([config.command, ...config.args], {
-      env: { ...process.env, ...config.env },
+    const cli = config.env.CODEX_CLI_PATH;
+    const command = cli ? [cli, "app-server", "--stdio"] : [config.command, ...config.args];
+    const proc = Bun.spawn(command, {
+      env: cli ? process.env : { ...process.env, ...config.env },
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
     }) as CuaProcess;
     this.#proc = proc;
     this.#pump(proc);
-    // `initialize` ANTES de `notifications/initialized`: o servidor rmcp recusa a ordem inversa.
-    const init = await this.#request(
-      "initialize",
-      {
-        protocolVersion: "2024-11-05",
-        capabilities: { elicitation: { form: {} } },
-        clientInfo: { name: "omp-codex-computer-use", version: "1.0.0" },
-      },
-      120_000,
-    );
-    if (init.error) {
-      this.kill();
-      throw new Error(`handshake MCP falhou: ${init.error.message ?? "erro sem mensagem"}`);
+    this.#threadId = null;
+    const clientInfo = { name: "omp-codex-computer-use", version: "1.0.0" };
+    if (cli) {
+      const init = await this.#request("initialize", { clientInfo }, 30_000);
+      if (init.error) throw new Error(init.error.message);
+      this.#write({ method: "initialized" });
+      const start = await this.#request("thread/start", {
+        ephemeral: true, cwd: process.cwd(), sandbox: "read-only",
+      }, 120_000);
+      const id = start.result?.thread?.id;
+      if (!id || start.error) throw new Error(start.error?.message ?? "Codex não criou a sessão do Computer Use");
+      this.#threadId = id;
+    } else {
+      // `initialize` ANTES de `notifications/initialized`: o servidor rmcp recusa a ordem inversa.
+      const init = await this.#request(
+        "initialize",
+        {
+          protocolVersion: "2024-11-05",
+          capabilities: { elicitation: { form: {} } },
+          clientInfo,
+        },
+        120_000,
+      );
+      if (init.error) {
+        this.kill();
+        throw new Error(`handshake MCP falhou: ${init.error.message ?? "erro sem mensagem"}`);
+      }
+      this.#write({ jsonrpc: "2.0", method: "notifications/initialized" });
     }
-    this.#write({ jsonrpc: "2.0", method: "notifications/initialized" });
+    this.browserNotice = config.browserUnavailable;
   }
 
   async call(name: string, args: unknown, timeoutMs: number): Promise<RpcResponse["result"]> {
-    if (!this.#proc) {
+    if (!this.#proc || this.#starting) {
       this.#starting ??= this.#boot().catch((err: unknown) => {
+        this.kill();
         this.#starting = null;
         throw err;
       });
       await this.#starting;
+      this.#starting = null;
     }
-    const res = await this.#request("tools/call", { name, arguments: args }, timeoutMs + 10_000);
+    const res = this.#threadId
+      ? await this.#request("mcpServer/tool/call", { threadId: this.#threadId, server: "cua_repl", tool: name, arguments: args }, timeoutMs + 10_000)
+      : await this.#request("tools/call", { name, arguments: args }, timeoutMs + 10_000);
     if (res.error) throw new Error(res.error.message ?? "erro sem mensagem");
     return res.result;
   }
@@ -199,7 +245,10 @@ class CuaClient {
     if (!proc) return;
     this.#proc = null;
     this.#starting = null;
+    for (const resolve of this.#pending.values()) resolve({ error: { message: "conexão Computer Use encerrada" } });
+    this.#pending.clear();
     try {
+      proc.stdin.end();
       proc.kill();
     } catch {}
   }
@@ -214,7 +263,7 @@ APIs do runtime (superfície completa, medida em 2026-09-18):
 - await cua.listApps() — todos os apps instalados
 - let app = await cua.getApp("Nome" | "bundle.id") — handle do app (lança se preciso) + árvore inicial
 - await app.getAXState({ disableDiffing: true }) — árvore de acessibilidade com índice e "ID:" de cada nó
-- await app.getScreenshot() — bytes PNG só da janela do app (sem pixel de outra janela por cima)
+- await app.getScreenshot() — imagem só da janela do app (sem pixel de outra janela por cima)
 - await app.getAXStateAndScreenshot(opts) — árvore + screenshot em uma ida só
 - await app.click(indice | [x, y]) — clique por índice de nó (preferir) ou coordenada
 - await app.paste("texto", { format }) — insere o texto EXATO (não passa por autocorreção)
@@ -254,12 +303,28 @@ Regras que evitam erro:
 
 export default function ompCodexComputerUse(pi: ExtensionAPI) {
   const z = pi.zod;
-  const client = new CuaClient();
+  let sessionUI: { confirm(title: string, message: string): Promise<boolean> } | undefined;
+  pi.on("session_start", (_event, ctx) => {
+    sessionUI = ctx.hasUI ? ctx.ui : undefined;
+  });
+  const client = new CuaClient(async (message) => await sessionUI?.confirm("Computer Use", message) ?? false);
   let shotSeq = 0;
+
+  function sniffImage(bytes: Buffer): { mimeType: string; ext: string } | null {
+    if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return { mimeType: "image/jpeg", ext: "jpg" };
+    if (bytes.length >= 8 && bytes.readUInt32BE(0) === 0x89504e47) return { mimeType: "image/png", ext: "png" };
+    if (bytes.length >= 12 && bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") return { mimeType: "image/webp", ext: "webp" };
+    if (bytes.length >= 6 && bytes.toString("ascii", 0, 3) === "GIF") return { mimeType: "image/gif", ext: "gif" };
+    return null;
+  }
 
   async function render(result: RpcResponse["result"]): Promise<RenderedResult> {
     const content: RenderedResult["content"] = [];
     const screenshots: string[] = [];
+    if (client.browserNotice) {
+      content.push({ type: "text", text: "Apps nativos habilitados. Esta sessão do OMP não recebeu o host de abas do Codex." });
+      client.browserNotice = false;
+    }
     for (const raw of result?.content ?? []) {
       if (!raw || typeof raw !== "object") continue;
       const part = raw as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
@@ -272,13 +337,15 @@ export default function ompCodexComputerUse(pi: ExtensionAPI) {
         continue;
       }
       if (part.type === "image" && typeof part.data === "string") {
-        const mimeType = typeof part.mimeType === "string" ? part.mimeType : "image/png";
-        const path = `${SHOT_DIR}/shot-${process.pid}-${++shotSeq}.png`;
+        const declared = typeof part.mimeType === "string" ? part.mimeType : "image/png";
+        const bytes = Buffer.from(part.data, "base64");
+        const sniffed = sniffImage(bytes) ?? { mimeType: declared, ext: declared.split("/")[1] || "bin" };
+        const path = `${SHOT_DIR}/shot-${process.pid}-${++shotSeq}.${sniffed.ext}`;
         try {
-          await Bun.write(path, Buffer.from(part.data, "base64"));
+          await Bun.write(path, bytes);
           screenshots.push(path);
         } catch {}
-        content.push({ type: "image", data: part.data, mimeType });
+        content.push({ type: "image", data: part.data, mimeType: sniffed.mimeType });
       }
     }
     if (screenshots.length) content.push({ type: "text", text: `screenshots gravados: ${screenshots.join(", ")}` });
@@ -313,7 +380,8 @@ export default function ompCodexComputerUse(pi: ExtensionAPI) {
     parameters: z.object({}),
     async execute() {
       try {
-        await client.call("js_reset", {}, 15_000);
+        const result = await client.call("js_reset", {}, 15_000);
+        if (result?.isError) return render(result);
         return { content: [{ type: "text", text: "cua_repl resetado" }] };
       } catch (err: unknown) {
         return { content: [{ type: "text", text: `reset falhou: ${String(err)}` }], isError: true };
