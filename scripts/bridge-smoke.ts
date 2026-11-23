@@ -1,3 +1,5 @@
+import { resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 // Harness descartável: prova a ponte omp-codex-computer-use contra o cua_repl vivo.
 // Uso: bun scripts/bridge-smoke.ts ./index.ts FIXED   (± control: git show HEAD:index.ts > /tmp/before.ts)
 interface ToolSpec {
@@ -8,6 +10,17 @@ type ExtensionEntry = (pi: unknown) => void;
 type Handler = (event: unknown, ctx: unknown) => void;
 
 const [, , modulePath, label] = process.argv;
+const ui = {
+  async confirm(title: string, message: string) {
+    if (!process.stdin.isTTY) return false;
+    const rl = createInterface({input: process.stdin, output: process.stdout});
+    try {
+      return (await rl.question(`${title}: ${message} [y/N] `)).trim().toLowerCase() === "y";
+    } finally {
+      rl.close();
+    }
+  },
+};
 const SESSION_ID = `smoke-${process.pid}`;
 
 // Proxy que aceita qualquer encadeamento de zod (`z.string().min(1).optional()`):
@@ -16,7 +29,7 @@ const zodStub = new Proxy(() => zodStub, { get: () => zodStub, apply: () => zodS
 
 // Import dinâmico obrigatório: o caminho do módulo é escolhido em runtime (argv),
 // justamente para rodar o mesmo harness contra a versão corrigida e a de controle.
-const mod = (await import(modulePath)) as { default: ExtensionEntry };
+const mod = (await import(resolve(modulePath))) as { default: ExtensionEntry };
 
 // Uma instância = um host `omp --mode rpc-ui`. Instanciar duas vezes com o MESMO
 // sessionId é a reciclagem do host que quebrou a sessão real.
@@ -32,7 +45,7 @@ function mountHost(): ToolSpec {
       (handlers[event] ??= []).push(handler);
     },
   });
-  for (const handler of handlers.session_start ?? []) handler({}, { sessionManager: { getSessionId: () => SESSION_ID } });
+  for (const handler of handlers.session_start ?? []) handler({}, { hasUI: !!process.stdin.isTTY, ui, sessionManager: { getSessionId: () => SESSION_ID } });
   const tool = tools.codex_computer_use;
   if (!tool) throw new Error("tool codex_computer_use não registrada");
   return tool;
@@ -68,16 +81,19 @@ function texts(call: Call): string {
 
 // Host 1 — sessão nova
 const host1 = mountHost();
-const first = await js(host1, 'globalThis.probe = 41 + 1; nodeRepl.write("probe set");');
+const first = await js(host1, "await cua.getState();");
 check("preambulo na primeira chamada", texts(first).includes("## Computer Use"), `len=${texts(first).length}`);
 check("sem aviso de reinicio na primeira", !texts(first).includes("reiniciou"), "silencio");
-check("repl grava variavel", texts(first).includes("probe set"), texts(first).slice(-20).replace(/\n/g, " | "));
+const set = await js(host1, 'globalThis.probe = 41 + 1; nodeRepl.write("probe set");');
+check("repl grava variavel", texts(set).includes("probe set"), texts(set).slice(-20).replace(/\n/g, " | "));
 
 const second = await js(host1, "nodeRepl.write(String(globalThis.probe));");
 check("preambulo NAO repete", !texts(second).includes("## Computer Use"), `len=${texts(second).length}`);
 check("variavel sobrevive chamada seguida", texts(second).includes("42"), texts(second).trim());
 
-const shot = await js(host1, 'const a = await cua.getApp("sh.zeron.app"); await a.getScreenshot();', 60_000);
+const finder = await js(host1, 'const a = await cua.getApp("Finder");');
+check("Finder via acessibilidade", !finder.isError && texts(finder).includes("Finder"), "janela do Finder");
+const shot = await js(host1, "await a.getScreenshot();", 60_000);
 const image = shot.content.find((p) => p.type === "image");
 const file = shot.details?.screenshots?.[0] ?? "";
 const magic = file ? (await Bun.file(file).bytes()).slice(0, 3) : new Uint8Array();
@@ -92,11 +108,12 @@ check("extensao casa com o byte", isJpeg ? file.endsWith(".jpg") : isPng ? file.
 
 // Host 2 — MESMA sessão de agente, processo/instância nova: a reciclagem do host
 const host2 = mountHost();
-const afterRecycle = await js(host2, "nodeRepl.write(String(globalThis.probe));", 60_000);
+const afterRecycle = await js(host2, "await cua.getState();", 60_000);
 const recycleText = texts(afterRecycle);
 check("host reciclado NAO reenvia preambulo", !recycleText.includes("## Computer Use"), `len=${recycleText.length}`);
 check("host reciclado ANUNCIA perda de estado", recycleText.includes("cua_repl reiniciou"), recycleText.split("\n")[0].slice(0, 150));
-check("estado realmente perdido (controle)", recycleText.includes("undefined"), recycleText.trim().slice(-40).replace(/\n/g, " | "));
+const variable = await js(host2, "nodeRepl.write(String(globalThis.probe));");
+check("estado realmente perdido (controle)", texts(variable).trim() === "undefined", texts(variable).slice(-40));
 
 const failed = results.filter((r) => r === "FAIL").length;
 console.log(`[${label}] === passed: ${results.length - failed} failed: ${failed}`);

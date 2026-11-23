@@ -18,8 +18,8 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import type { Subprocess } from "bun";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-const HOME = process.env.HOME ?? "";
-const PLUGIN_DIR = `${HOME}/.codex/plugins/cache/openai-bundled/unified-computer-use`;
+const codexHome = process.env.CODEX_HOME ?? `${process.env.HOME}/.codex`;
+const PLUGIN_DIR = `${codexHome}/plugins/cache/openai-bundled/unified-computer-use`;
 const PREAMBLE_PREFIX = "## Computer Use";
 const SHOT_DIR = `${(process.env.TMPDIR ?? "/tmp").replace(/\/+$/, "")}/omp-codex-cua`;
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -33,6 +33,7 @@ interface McpConfig {
   command: string;
   args: string[];
   env: Record<string, string>;
+  browserUnavailable: boolean;
 }
 
 /// Estado da ponte que precisa sobreviver à troca do processo host.
@@ -44,9 +45,10 @@ interface BridgeState {
 }
 
 interface RpcResponse {
-  id?: number;
+  id?: number | string;
+  params?: Record<string, unknown>;
   method?: string;
-  result?: { content?: unknown[]; isError?: boolean };
+  result?: { thread?: { id?: string }; content?: unknown[]; isError?: boolean };
   error?: { message?: string };
 }
 
@@ -61,50 +63,62 @@ type CuaProcess = Subprocess<"pipe", "pipe", "pipe">;
 function asRpcResponse(value: unknown): RpcResponse | null {
   if (!value || typeof value !== "object") return null;
   const msg = value as Record<string, unknown>;
-  const id = typeof msg.id === "number" ? msg.id : undefined;
+  const id = typeof msg.id === "number" || typeof msg.id === "string" ? msg.id : undefined;
   const method = typeof msg.method === "string" ? msg.method : undefined;
   const result = msg.result && typeof msg.result === "object" ? (msg.result as RpcResponse["result"]) : undefined;
   const error = msg.error && typeof msg.error === "object" ? (msg.error as RpcResponse["error"]) : undefined;
-  return { id, method, result, error };
+  return { id, method, params: msg.params as RpcResponse["params"], result, error };
 }
 
-function resolveMcpConfig(): McpConfig {
-  if (!existsSync(PLUGIN_DIR)) {
+export function resolveMcpConfig(pluginDir = PLUGIN_DIR, hostEnv = process.env): McpConfig {
+  if (!existsSync(pluginDir)) {
     throw new Error(
-      `runtime do Codex Computer Use ausente: ${PLUGIN_DIR} não existe. Instale/abra o ChatGPT.app para materializar o plugin unified-computer-use.`,
+      `runtime do Codex Computer Use ausente: ${pluginDir} não existe. Instale/abra o ChatGPT.app para materializar o plugin unified-computer-use.`,
     );
   }
-  const versions = readdirSync(PLUGIN_DIR).sort().reverse();
+  const versions = readdirSync(pluginDir).filter((name) => /^\d+(?:\.\d+)*$/.test(name))
+    .sort((a, b) => b.localeCompare(a, "en", { numeric: true }));
   for (const version of versions) {
-    const mcpPath = `${PLUGIN_DIR}/${version}/.mcp.json`;
+    const mcpPath = `${pluginDir}/${version}/.mcp.json`;
     if (!existsSync(mcpPath)) continue;
     const manifest: unknown = JSON.parse(readFileSync(mcpPath, "utf8"));
-    const server = (manifest as { mcpServers?: { cua_repl?: { command?: unknown; args?: unknown; env?: unknown } } })?.mcpServers?.cua_repl;
+    const server = (manifest as { mcpServers?: { cua_repl?: { command?: unknown; args?: unknown; env?: unknown; enabled?: boolean; env_vars?: string[] } } })?.mcpServers?.cua_repl;
+    if (server?.enabled === false) throw new Error(`cua_repl está desativado em ${mcpPath}`);
     if (typeof server?.command !== "string" || !Array.isArray(server.args)) continue;
     const env = server.env && typeof server.env === "object" ? (server.env as Record<string, string>) : {};
+    const surfaces = env.CUA_REPL_ENABLED_SURFACES?.split(",") ?? ["computer"];
+    const browserHostKeys = ["BROWSER_USE_ACCESS_PIPE_PATH", "BROWSER_USE_ACCESS_VERIFYING_IDENTITY"];
+    const browserUnavailable = surfaces.includes("browser") &&
+      !browserHostKeys.every((key) => server.env_vars?.includes(key) && hostEnv[key]);
+    if (browserUnavailable && !surfaces.includes("computer")) {
+      throw new Error("O manifesto habilita apenas navegador e esta sessão não recebeu o host de abas.");
+    }
     return {
       command: server.command,
       args: server.args.filter((a): a is string => typeof a === "string"),
-      // Só a superfície nativa: sem isso o runtime exige turn token do browser do Codex.
-      env: { ...env, CUA_REPL_ENABLED_SURFACES: "computer" },
+      env: { ...env, CUA_REPL_ENABLED_SURFACES: browserUnavailable ? "computer" : surfaces.join(",") },
+      browserUnavailable,
     };
   }
-  throw new Error(`nenhum .mcp.json com mcpServers.cua_repl em ${PLUGIN_DIR}/<versão>/ (versões: ${versions.join(", ") || "nenhuma"})`);
+  throw new Error(`nenhum .mcp.json com mcpServers.cua_repl em ${pluginDir}/<versão>/ (versões: ${versions.join(", ") || "nenhuma"})`);
 }
 
 class CuaClient {
   #proc: CuaProcess | null = null;
   #starting: Promise<void> | null = null;
   #nextId = 1;
+  #threadId: string | null = null;
   // Map: chaves numéricas criadas e removidas em runtime.
   #pending = new Map<number, (msg: RpcResponse) => void>();
   #stderr = "";
   #exitReason: string | null = null;
   // Chamado depois de cada handshake: um REPL novo nasceu, e quem cuida do
   // estado durável decide se isso é a primeira sessão ou uma perda de estado.
-  #onBoot: (exitReason: string | null) => void;
+  #onBoot: (exitReason: string | null, browserUnavailable: boolean) => void;
+  #confirm: (message: string) => Promise<boolean>;
 
-  constructor(onBoot: (exitReason: string | null) => void) {
+  constructor(onBoot: (exitReason: string | null, browserUnavailable: boolean) => void, confirm: (message: string) => Promise<boolean>) {
+    this.#confirm = confirm;
     this.#onBoot = onBoot;
   }
 
@@ -117,13 +131,14 @@ class CuaClient {
 
   #pump(proc: CuaProcess) {
     const decoder = new TextDecoder();
+    const stderrDecoder = new TextDecoder();
     void (async () => {
-      for await (const chunk of proc.stderr) this.#stderr = (this.#stderr + decoder.decode(chunk)).slice(-4000);
+      for await (const chunk of proc.stderr) this.#stderr = (this.#stderr + stderrDecoder.decode(chunk, { stream: true })).slice(-4000);
     })().catch(() => {});
     void (async () => {
       let buf = "";
       for await (const chunk of proc.stdout) {
-        buf += decoder.decode(chunk);
+        buf += decoder.decode(chunk, { stream: true });
         for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
           const line = buf.slice(0, nl).trim();
           buf = buf.slice(nl + 1);
@@ -136,16 +151,21 @@ class CuaClient {
           }
           const msg = asRpcResponse(parsed);
           if (!msg) continue;
-          // O runtime confirma política por elicitation/create; aceitamos em nome da sessão.
-          if (msg.method === "elicitation/create" && msg.id !== undefined) {
-            this.#write({
-              jsonrpc: "2.0",
-              id: msg.id,
-              result: { action: "accept", content: { source: "computer-use-persisted-state", persist: "always" } },
+          if ((msg.method === "elicitation/create" || msg.method === "mcpServer/elicitation/request") && msg.id !== undefined) {
+            const params = msg.params;
+            const schema = params?.requestedSchema as { type?: string; properties?: object } | undefined;
+            const fromCua = msg.method === "elicitation/create" ||
+              (params?.serverName === "cua_repl" && params?.threadId === this.#threadId);
+            const canConfirm = fromCua && (!params?.mode || params.mode === "form") && schema?.type === "object" &&
+              !Object.keys(schema.properties ?? {}).length && typeof params?.message === "string";
+            const confirmed = canConfirm && await this.#confirm(params.message as string).catch(() => false);
+            if (this.#proc === proc) this.#write({
+              jsonrpc: "2.0", id: msg.id,
+              result: confirmed ? { action: "accept", content: {} } : { action: "decline" },
             });
             continue;
           }
-          const resolve = msg.id === undefined ? undefined : this.#pending.get(msg.id);
+          const resolve = typeof msg.id === "number" && !msg.method ? this.#pending.get(msg.id) : undefined;
           if (resolve) {
             this.#pending.delete(msg.id);
             resolve(msg);
@@ -155,6 +175,7 @@ class CuaClient {
     })()
       .catch(() => {})
       .finally(() => {
+        if (this.#proc !== proc) return;
         const signal = proc.signalCode ?? null;
         const code = proc.exitCode ?? null;
         this.#exitReason = `${signal ? `sinal ${signal}` : `exit ${code ?? "?"}`}, stderr: ${this.#stderr || "(vazio)"}`;
@@ -183,41 +204,61 @@ class CuaClient {
 
   async #boot() {
     const config = resolveMcpConfig();
-    const proc = Bun.spawn([config.command, ...config.args], {
-      env: { ...process.env, ...config.env },
+    const cli = config.env.CODEX_CLI_PATH;
+    const command = cli ? [cli, "app-server", "--stdio"] : [config.command, ...config.args];
+    const proc = Bun.spawn(command, {
+      env: cli ? process.env : { ...process.env, ...config.env },
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
     }) as CuaProcess;
     this.#proc = proc;
     this.#pump(proc);
-    // `initialize` ANTES de `notifications/initialized`: o servidor rmcp recusa a ordem inversa.
-    const init = await this.#request(
-      "initialize",
-      {
-        protocolVersion: "2024-11-05",
-        capabilities: { elicitation: { form: {} } },
-        clientInfo: { name: "omp-codex-computer-use", version: "1.0.0" },
-      },
-      120_000,
-    );
-    if (init.error) {
-      this.kill();
-      throw new Error(`handshake MCP falhou: ${init.error.message ?? "erro sem mensagem"}`);
+    this.#threadId = null;
+    const clientInfo = { name: "omp-codex-computer-use", version: "1.0.0" };
+    if (cli) {
+      const init = await this.#request("initialize", { clientInfo }, 30_000);
+      if (init.error) throw new Error(init.error.message);
+      this.#write({ method: "initialized" });
+      const start = await this.#request("thread/start", {
+        ephemeral: true, cwd: process.cwd(), sandbox: "read-only",
+      }, 120_000);
+      const id = start.result?.thread?.id;
+      if (!id || start.error) throw new Error(start.error?.message ?? "Codex não criou a sessão do Computer Use");
+      this.#threadId = id;
+    } else {
+      // `initialize` ANTES de `notifications/initialized`: o servidor rmcp recusa a ordem inversa.
+      const init = await this.#request(
+        "initialize",
+        {
+          protocolVersion: "2024-11-05",
+          capabilities: { elicitation: { form: {} } },
+          clientInfo,
+        },
+        120_000,
+      );
+      if (init.error) {
+        this.kill();
+        throw new Error(`handshake MCP falhou: ${init.error.message ?? "erro sem mensagem"}`);
+      }
+      this.#write({ jsonrpc: "2.0", method: "notifications/initialized" });
     }
-    this.#write({ jsonrpc: "2.0", method: "notifications/initialized" });
-    this.#onBoot(this.#exitReason);
+    this.#onBoot(this.#exitReason, config.browserUnavailable);
   }
 
   async call(name: string, args: unknown, timeoutMs: number): Promise<RpcResponse["result"]> {
-    if (!this.#proc) {
+    if (!this.#proc || this.#starting) {
       this.#starting ??= this.#boot().catch((err: unknown) => {
+        this.kill();
         this.#starting = null;
         throw err;
       });
       await this.#starting;
+      this.#starting = null;
     }
-    const res = await this.#request("tools/call", { name, arguments: args }, timeoutMs + 10_000);
+    const res = this.#threadId
+      ? await this.#request("mcpServer/tool/call", { threadId: this.#threadId, server: "cua_repl", tool: name, arguments: args }, timeoutMs + 10_000)
+      : await this.#request("tools/call", { name, arguments: args }, timeoutMs + 10_000);
     if (res.error) throw new Error(res.error.message ?? "erro sem mensagem");
     return res.result;
   }
@@ -227,7 +268,10 @@ class CuaClient {
     if (!proc) return;
     this.#proc = null;
     this.#starting = null;
+    for (const resolve of this.#pending.values()) resolve({ error: { message: "conexão Computer Use encerrada" } });
+    this.#pending.clear();
     try {
+      proc.stdin.end();
       proc.kill();
     } catch {}
   }
@@ -328,7 +372,8 @@ export default function ompCodexComputerUse(pi: ExtensionAPI) {
   // Um REPL novo nasceu. Se esta sessão de agente já tinha tido um, o modelo
   // precisa saber ANTES de reusar um handle: foi exatamente assim que um
   // `zeron is not defined` apareceu do nada no meio de uma sessão.
-  const client = new CuaClient((exitReason) => {
+  let sessionUI: { confirm(title: string, message: string): Promise<boolean> } | undefined;
+  const client = new CuaClient((exitReason, browserUnavailable) => {
     const state = readState();
     const next = { preambleSent: state.preambleSent, boots: state.boots + 1 };
     writeState(next);
@@ -336,7 +381,11 @@ export default function ompCodexComputerUse(pi: ExtensionAPI) {
       const why = exitReason ?? "host do omp reciclado (processo desta extensão é novo)";
       pendingNotice = `[cua_repl reiniciou — ${why}] As variáveis do REPL e os handles de app/tab desta sessão foram perdidos: rebinde com cua.getApp/cua.getTab antes de agir.`;
     }
-  });
+    if (browserUnavailable) {
+      const notice = "Apps nativos habilitados. Esta sessão do OMP não recebeu o host de abas do Codex.";
+      pendingNotice = pendingNotice ? `${pendingNotice}\n${notice}` : notice;
+    }
+  }, async (message) => await sessionUI?.confirm("Computer Use", message) ?? false);
 
   // O runtime anuncia image/png e manda JPEG; com o rótulo errado o host recusa
   // a imagem inteira. O byte manda.
@@ -411,7 +460,8 @@ export default function ompCodexComputerUse(pi: ExtensionAPI) {
     parameters: z.object({}),
     async execute() {
       try {
-        await client.call("js_reset", {}, 15_000);
+        const result = await client.call("js_reset", {}, 15_000);
+        if (result?.isError) return render(result);
         return { content: [{ type: "text", text: "cua_repl resetado" }] };
       } catch (err: unknown) {
         return { content: [{ type: "text", text: `reset falhou: ${String(err)}` }], isError: true };
@@ -422,6 +472,7 @@ export default function ompCodexComputerUse(pi: ExtensionAPI) {
   // A chave do estado durável. Sem ela o preâmbulo voltaria inteiro a cada
   // troca do host, e um REPL novo passaria por REPL antigo.
   pi.on("session_start", (_event, ctx) => {
+    sessionUI = ctx.hasUI ? ctx.ui : undefined;
     try {
       sessionId = ctx.sessionManager.getSessionId() ?? null;
     } catch {}

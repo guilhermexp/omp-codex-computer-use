@@ -5,7 +5,7 @@ Codex's native macOS **Computer Use** runtime (`cua_repl`) exposed as tools for 
 Port of [`pi-codex-computer-use`](https://github.com/guilhermexp/pi-codex-computer-use) (host Pi) to omp's `ExtensionAPI`.
 
 The extension bundles no runtime. It resolves whatever Codex installed at
-`~/.codex/plugins/cache/openai-bundled/unified-computer-use/<version>/.mcp.json` and speaks stdio MCP to it.
+`~/.codex/plugins/cache/openai-bundled/unified-computer-use/<version>/.mcp.json` and uses the Codex app server when the manifest provides its CLI. Older manifests use MCP over stdio.
 
 ## Install
 
@@ -27,7 +27,7 @@ Start a new omp session afterwards; extensions load at session start.
 - **ChatGPT.app installed** (the runtime lives in its bundle: `/Applications/ChatGPT.app/Contents/Resources/cua_node/`). It does **not** need to be running — the `SkyComputerUseService` helper is launched on demand. Uninstalling ChatGPT.app breaks the extension.
 - Accessibility permission granted to **`Codex Computer Use.app`** (`~/.codex/computer-use/`), not to ChatGPT.app.
 
-Verify the whole chain with the preflight below.
+On the November 2026 runtime, OMP opens its own ephemeral, read-only thread through the Codex app server. Native apps authenticate through that connection. Direct browser access also depends on the browser host and an active Codex turn. Run `scripts/cua-preflight.py --browser` to check browser availability explicitly.
 
 ## Tools
 
@@ -40,7 +40,7 @@ Evaluates JavaScript in the `cua_repl` runtime. REPL state (variables, app/tab h
 | `code` | string | statements evaluated in the runtime |
 | `timeout_ms` | integer | 1000–300000, default 30000 |
 
-Runtime API (measured against plugin `26.915.31029`):
+Runtime API (current verified build in `upstream.json`):
 
 ```js
 await cua.getState()                       // running apps: displayName + bundle id, plus browsers
@@ -95,7 +95,7 @@ bun scripts/bridge-smoke.ts ./index.ts FIXED
 git show HEAD:index.ts > /tmp/before.ts && bun scripts/bridge-smoke.ts /tmp/before.ts BEFORE   # ± control
 ```
 
-It asserts the preamble goes out once and never again, that the REPL keeps its variables between calls, that a recycled host announces the state loss instead of going silent, and that the image mimeType and file extension match the actual bytes. Ten checks; the pre-fix module fails four of them.
+It asserts the preamble goes out once and never again, that the REPL keeps its variables between calls, that a recycled host announces the state loss instead of going silent, and that the image mimeType and file extension match the actual bytes. It also reads the Finder window through the same transport.
 
 ## Upstream drift
 
@@ -104,6 +104,7 @@ It asserts the preamble goes out once and never again, that the REPL keeps its v
 ```bash
 scripts/cua-preflight.py            # 0 PASS · 3 DRIFT · 4 INFRA · 5 STALE-PIN
 scripts/cua-preflight.py --remote   # also compares the upstream repo HEAD
+scripts/cua-preflight.py --browser      # requires a browser in the current session
 scripts/cua-preflight.py --json
 scripts/cua-preflight.py --update-pin   # re-pin after reviewing what changed
 ```
@@ -121,7 +122,7 @@ Codex updates flow in by themselves (the plugin version jumped `26.908.70816` �
 
 Computer Use delivers keystrokes and clicks through the Accessibility API, so **nothing passes through shell-command guards** that inspect `bash` input. Never point it at an open terminal, shell or REPL. Isolation is the target app's responsibility: it reads the user's real config and database. Quit only what your session opened.
 
-The extension auto-accepts the runtime's `elicitation/create` policy prompt (the Pi version does the same; without it every call blocks), so the confirmation Codex designed does not gate this path. omp's `approval: "exec"` is what remains.
+When the runtime requests confirmation, the extension shows the request in OMP. Sessions without an interactive UI decline it. The preflight reports a required confirmation as an infrastructure dependency.
 
 ## License
 
